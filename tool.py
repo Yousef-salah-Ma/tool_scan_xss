@@ -1,107 +1,139 @@
 import requests
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.alert import Alert
 import json
+import time
+import csv
 
-# Function to read payloads from a file
 def read_payloads_from_file(file_path):
     with open(file_path, 'r') as file:
         payloads = [line.strip() for line in file.readlines()]
-    return payloads
+    return payloads  # Load all payloads
 
-# Function to inject XSS into a URL
 def inject_xss_in_url(url, payload):
     parsed_url = urlparse(url)
     query_params = parse_qs(parsed_url.query)
-    
-    # Update all parameters to replace their values with the payload
+
     for param in query_params:
         query_params[param] = [payload]
-    
+
     modified_query = urlencode(query_params, doseq=True)
     modified_url = parsed_url._replace(query=modified_query)
-    
+
     return urlunparse(modified_url)
 
-# Function to test XSS in a URL using Selenium
-def test_xss_with_selenium(url, payloads, results):
-    driver = webdriver.Chrome()  # Ensure you have installed ChromeDriver
+def test_xss_with_selenium(driver, url, payloads, results):
     for payload in payloads:
-        modified_url = inject_xss_in_url(url, payload)  # Inject XSS into the URL
-        
-        driver.get(modified_url)
-        
-        try:
-            # Attempt to check the type of alert (alert, confirm, prompt)
-            alert = Alert(driver)
-            alert_text = alert.text
-            results.append({"url": modified_url, "payload": payload, "alert": alert_text})
-            alert.accept()
-        except:
-            try:
-                confirm = driver.switch_to.alert
-                confirm.accept()  # If it's a confirm alert, accept it
-                results.append({"url": modified_url, "payload": payload, "alert": "confirm"})
-            except:
-                try:
-                    prompt = driver.switch_to.alert
-                    prompt.send_keys('Test')  # Send text to test a prompt
-                    prompt.accept()
-                    results.append({"url": modified_url, "payload": payload, "alert": "prompt"})
-                except:
-                    results.append({"url": modified_url, "payload": payload, "alert": "No XSS detected"})
-    
-    driver.quit()
+        modified_url = inject_xss_in_url(url, payload) 
 
-# Function to test XSS in a URL using requests and BeautifulSoup
+        try:
+            driver.get(modified_url)
+
+           
+            try:
+                alert = Alert(driver)
+                alert_text = alert.text
+                results.append({"url": modified_url, "payload": payload, "alert": alert_text})
+                alert.accept() 
+                break  
+            except:
+                pass  
+
+          
+            script_to_check = """
+            let detectedEvents = [];
+            let allElements = document.querySelectorAll('*');
+            allElements.forEach(element => {
+                let events = ['onmouseover', 'onclick', 'onfocus', 'onblur', 'oninput', 'onchange', 'onkeydown'];
+                events.forEach(event => {
+                    let eventListener = element.getAttribute(event);
+                    if (eventListener && eventListener.includes('alert')) {
+                        detectedEvents.push(event + ': ' + eventListener);
+                    }
+                });
+            });
+            return detectedEvents;
+            """
+            try:
+                detected_events = driver.execute_script(script_to_check)
+                if detected_events:
+                    results.append({"url": modified_url, "payload": payload, "events": detected_events})
+            except Exception as e:
+                results.append({"url": modified_url, "payload": payload, "error": str(e)})
+        except Exception as e:
+            results.append({"url": modified_url, "payload": payload, "error": str(e)})
+
+
 def test_xss_in_url(url, payloads, results):
     for payload in payloads:
-        modified_url = inject_xss_in_url(url, payload)  # Inject XSS into the URL
-        
+        modified_url = inject_xss_in_url(url, payload) 
+
         try:
             response = requests.get(modified_url, timeout=10)
+            response.raise_for_status() 
             response_text = response.text
-            
-            # Use BeautifulSoup to parse the response text
+
             soup = BeautifulSoup(response_text, 'html.parser')
-            
-            # Check if the payload is present in the response in multiple ways
+          
             if payload in response.url or payload in response_text or any(payload in element for element in soup.stripped_strings):
                 results.append({"url": modified_url, "payload": payload, "alert": "XSS Detected"})
-            else:
-                results.append({"url": modified_url, "payload": payload, "alert": "No XSS found"})
+        except requests.exceptions.Timeout:
+            results.append({"url": modified_url, "payload": payload, "error": "Timeout"})
         except requests.exceptions.RequestException as e:
-            results.append({"url": modified_url, "payload": payload, "alert": f"Error: {e}"})
+            results.append({"url": modified_url, "payload": payload, "error": str(e)})
 
-# Function to process all URLs from a file
-def process_urls_from_file(urls_file_path, payloads_file_path, use_selenium=False):
+
+def process_urls_from_file(urls_file_path, payloads_file_path, use_selenium=False, use_multithreading=True):
     payloads = read_payloads_from_file(payloads_file_path)
     with open(urls_file_path, 'r') as file:
         urls = [line.strip() for line in file.readlines()]
-    
+
     results = []
-    
+
     if use_selenium:
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        
+        driver = webdriver.Chrome() 
+        try:
             for url in urls:
-                executor.submit(test_xss_with_selenium, url, payloads, results)
+                test_xss_with_selenium(driver, url, payloads, results)
+        finally:
+            driver.quit() 
     else:
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        if use_multithreading:
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = []
+                for url in urls:
+                    futures.append(executor.submit(test_xss_in_url, url, payloads, results))
+
+            
+                for future in as_completed(futures):
+                    future.result() 
+        else:
+          
             for url in urls:
-                executor.submit(test_xss_in_url, url, payloads, results)
-    
-    # Save the results in a JSON file
+                test_xss_in_url(url, payloads, results)
+
+  
     with open('xss_results.json', 'w') as outfile:
         json.dump(results, outfile, indent=4)
-    print("Results saved to xss_results.json")
 
-# File paths for the URLs and payloads
-urls_file_path = "url.txt"  # Replace this with the name of your file containing URLs
-payloads_file_path = "payloads.txt"  # Replace this with the name of your file containing payloads
-use_selenium = True  # Choose whether to use Selenium or requests
+   
+    with open('xss_results.csv', 'w', newline='') as csvfile:
+        fieldnames = ["url", "payload", "alert", "events", "error"] 
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in results:
+            writer.writerow(result)
 
-# Process the URLs
-process_urls_from_file(urls_file_path, payloads_file_path, use_selenium)
+    print("Results saved to xss_results.json and xss_results.csv")
+
+
+urls_file_path = "https.txt" 
+payloads_file_path = "strong_xss_payloads.txt" 
+use_selenium = True  
+use_multithreading = True
+
+process_urls_from_file(urls_file_path, payloads_file_path, use_selenium, use_multithreading)
